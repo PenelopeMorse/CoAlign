@@ -607,7 +607,7 @@ class LLMPlanner(Planner):
                 },
                 "is_done": {agent.uid: self.is_done for agent in self.agents},
             }
-            return {}, planner_info, self.is_done
+            return {}, self._augment_planner_info(planner_info), self.is_done
 
         if self.curr_prompt == "":
             # Prepare prompts
@@ -685,7 +685,7 @@ class LLMPlanner(Planner):
                         agent.uid: ("Done", None, None) for agent in self.agents
                     },
                 }
-                return {}, planner_info, self.is_done
+                return {}, self._augment_planner_info(planner_info), self.is_done
 
             # Parse high level action directives from llm response
             high_level_actions = self.actions_parser(
@@ -737,7 +737,11 @@ class LLMPlanner(Planner):
         planner_info["agent_states"] = self.get_last_agent_states()
         planner_info["agent_positions"] = self.get_last_agent_positions()
         planner_info["agent_collisions"] = self.get_agent_collisions()
-        return low_level_actions, planner_info, self.is_done
+        return (
+            low_level_actions,
+            self._augment_planner_info(planner_info),
+            self.is_done,
+        )
 
     def check_if_agent_done(self, llm_response: str) -> bool:
         """

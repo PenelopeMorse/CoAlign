@@ -16,6 +16,6 @@ from habitat_llm.world_model.entity import (
     UncategorizedEntity,
 )
 from habitat_llm.world_model.graph import Graph
-from habitat_llm.world_model.world_graph import WorldGraph
+from habitat_llm.world_model.world_graph import BeliefGraphContainer, WorldGraph
 
 from habitat_llm.world_model.dynamic_world_graph import DynamicWorldGraph  # isort: skip
