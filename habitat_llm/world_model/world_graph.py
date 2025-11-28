@@ -6,7 +6,8 @@
 
 import logging
 from collections import defaultdict
-from typing import List, Optional, Union
+from copy import deepcopy
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 
@@ -41,12 +42,14 @@ class WorldGraph(Graph):
     """
 
     # Parameterized Constructor
-    def __init__(self, graph=None):
+    def __init__(self, graph=None, graph_type: Optional[str] = None):
         # Create a graph to store different entities in the world
         # and their relations to one another
         super().__init__(graph=graph)
         self.agent_asymmetry = False
         self.world_model_type = "privileged"
+        # Source identifier to distinguish robot/human belief graphs
+        self.graph_type = graph_type
         self._logger = logging.getLogger(__name__)
         FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
         logging.basicConfig(format=FORMAT)
@@ -553,7 +556,7 @@ class WorldGraph(Graph):
         Method to deep copy this instance
         """
         graph_copy = super().__deepcopy__(memo)
-        wg = WorldGraph()
+        wg = WorldGraph(graph_type=self.graph_type)
         wg.graph = graph_copy.graph
         return wg
 
@@ -619,3 +622,60 @@ class WorldGraph(Graph):
         else:
             within_threshold = closest
         return within_threshold
+
+
+class BeliefGraphContainer:
+    """Container that keeps robot and human belief graphs in sync.
+
+    It provides helper APIs to update each belief independently, switch the active
+    view, and compute divergence between the two graphs.
+    """
+
+    def __init__(
+        self,
+        robot_graph: Optional[WorldGraph] = None,
+        human_graph: Optional[WorldGraph] = None,
+    ) -> None:
+        self._graphs: Dict[str, WorldGraph] = {
+            "robot": robot_graph or WorldGraph(graph_type="robot"),
+            "human": human_graph or WorldGraph(graph_type="human"),
+        }
+        # Track the active graph type for convenience (defaults to robot)
+        self.active_graph_type: str = "robot"
+
+    def set_active_graph(self, graph_type: str) -> None:
+        if graph_type not in self._graphs:
+            raise ValueError(f"Unknown graph_type {graph_type}")
+        self.active_graph_type = graph_type
+
+    def get_graph(self, graph_type: Optional[str] = None) -> WorldGraph:
+        graph_type = graph_type or self.active_graph_type
+        if graph_type not in self._graphs:
+            raise ValueError(f"Unknown graph_type {graph_type}")
+        return self._graphs[graph_type]
+
+    def update_robot_belief(
+        self, recent_graph: Graph, partial_obs: bool, update_mode: str, add_only: bool = False
+    ) -> None:
+        self._graphs["robot"].update(recent_graph, partial_obs, update_mode, add_only)
+
+    def update_human_belief(
+        self, recent_graph: Graph, partial_obs: bool, update_mode: str, add_only: bool = False
+    ) -> None:
+        self._graphs["human"].update(recent_graph, partial_obs, update_mode, add_only)
+
+    def sync_graphs(self, from_graph: str = "robot", to_graph: str = "human") -> None:
+        """Copy belief state from one graph to the other."""
+
+        if from_graph not in self._graphs or to_graph not in self._graphs:
+            raise ValueError("sync_graphs requires valid graph keys: 'robot' or 'human'")
+        self._graphs[to_graph] = deepcopy(self._graphs[from_graph])
+        self._graphs[to_graph].graph_type = to_graph
+
+    def compute_belief_divergence(self) -> Dict[str, float]:
+        from habitat_llm.world_model.belief_divergence import compute_belief_divergence
+
+        return compute_belief_divergence(
+            self._graphs["robot"],
+            self._graphs["human"],
+        )

@@ -30,7 +30,7 @@ from habitat_llm.sims.metadata_interface import get_metadata_dict_from_config
 from habitat_llm.utils.core import separate_agent_idx
 
 # LOCAL
-from habitat_llm.world_model import DynamicWorldGraph, WorldGraph
+from habitat_llm.world_model import BeliefGraphContainer, DynamicWorldGraph, WorldGraph
 
 if hasattr(torch, "inference_mode"):
     inference_mode = torch.inference_mode
@@ -139,6 +139,12 @@ class EnvironmentInterface:
         self._trajectory_idx: int = None
         self._setup_current_episode_logging: bool = False
 
+    def _refresh_world_graph_aliases(self) -> None:
+        """Keep the flat world_graph mapping in sync with the belief container."""
+
+        self.world_graph[self.robot_agent_uid] = self.belief_graphs.get_graph("robot")
+        self.world_graph[self.human_agent_uid] = self.belief_graphs.get_graph("human")
+
     def initialize_perception_and_world_graph(self):
         """
         This method initializes perception and world graph
@@ -172,6 +178,12 @@ class EnvironmentInterface:
                 self.robot_agent_uid: WorldGraph(),
                 self.human_agent_uid: WorldGraph(),
             }
+
+        # dual belief container to coordinate robot and human graphs
+        self.belief_graphs = BeliefGraphContainer(
+            robot_graph=self.world_graph[self.robot_agent_uid],
+            human_graph=self.world_graph[self.human_agent_uid],
+        )
 
         # set agent-asymmetry flag if True
         if self.conf.agent_asymmetry:
@@ -244,10 +256,12 @@ class EnvironmentInterface:
             subgraph = self.perception.initialize(self.partial_obs)
             # Get ground truth subgraph from the current observations.
             # since the graph is being initialized, we only add the new nodes and edges
-            for agent_key in self.world_graph:
-                self.world_graph[agent_key].update(
-                    subgraph, self.partial_obs, self.wm_update_mode, add_only=True
-                )
+            self.belief_graphs.update_robot_belief(
+                subgraph, self.partial_obs, self.wm_update_mode, add_only=True
+            )
+            # keep human belief in sync with the initial world unless updated later
+            self.belief_graphs.sync_graphs("robot", "human")
+            self._refresh_world_graph_aliases()
         else:
             raise ValueError(
                 f"World model not implemented for type: {self.conf.world_model.type}"
@@ -466,6 +480,19 @@ class EnvironmentInterface:
 
         return
 
+    def apply_human_belief_update(self, human_subgraph, update_mode: str = "gt") -> None:
+        """Update the human belief graph from interaction/language feedback."""
+
+        self.belief_graphs.update_human_belief(
+            human_subgraph, self.partial_obs, update_mode
+        )
+        self._refresh_world_graph_aliases()
+
+    def get_belief_divergence(self) -> Dict[str, float]:
+        """Expose divergence metrics for downstream consumers like the planner."""
+
+        return self.belief_graphs.compute_belief_divergence()
+
     def update_world_graphs_using_sim(self, obs):
         """
         This method updates world graphs for both agents using
@@ -475,8 +502,12 @@ class EnvironmentInterface:
         # Case 1: FULL OBSERVABILITY
         # Set both agents graphs equal to full world graph
         if not self.partial_obs:
-            for agent_uid in self.world_graph:
-                self.world_graph[agent_uid] = self.full_world_graph
+            self.belief_graphs.update_robot_belief(
+                self.full_world_graph, partial_obs=False, update_mode="gt"
+            )
+            # initialize human belief to match robot's view until explicit updates arrive
+            self.belief_graphs.sync_graphs("robot", "human")
+            self._refresh_world_graph_aliases()
 
         # Case 2: PARTIAL OBSERVABILITY
         # Update both graphs using both human and robot observations
@@ -486,31 +517,12 @@ class EnvironmentInterface:
                 [str(self.robot_agent_uid), str(self.human_agent_uid)], obs
             )
 
-            # Get human subgraph using only human observations
-            observation_sources = []
-            if self.conf.agent_asymmetry:
-                # under asymmetry condition human's world-graph only uses human's own observations
-                observation_sources = [str(self.human_agent_uid)]
-            else:
-                # under symmetry condition the human's world-graph uses both human's and Spot's observations
-                observation_sources = [
-                    str(self.robot_agent_uid),
-                    str(self.human_agent_uid),
-                ]
-            most_recent_human_subgraph = self.perception.get_recent_subgraph(
-                observation_sources,
-                obs,
-            )
-
-            # Update robot graph
-            self.world_graph[self.robot_agent_uid].update(
+            # Update robot graph only based on real observations
+            self.belief_graphs.update_robot_belief(
                 most_recent_robot_subgraph, self.partial_obs, self.wm_update_mode
             )
-
-            # Update human graph
-            self.world_graph[self.human_agent_uid].update(
-                most_recent_human_subgraph, self.partial_obs, self.wm_update_mode
-            )
+            # human belief can be updated later via interaction or language feedback
+            self._refresh_world_graph_aliases()
 
         return
 
@@ -547,22 +559,8 @@ class EnvironmentInterface:
             )
         else:
             raise ValueError("Frame description is None")
-        # update the world-graph for the human agent
-        if self.conf.agent_asymmetry:
-            most_recent_human_subgraph = self.perception.get_recent_subgraph(
-                self.sim, [str(self.human_agent_uid)], obs
-            )
-        else:
-            most_recent_human_subgraph = self.perception.get_recent_subgraph(
-                self.sim,
-                [str(self.robot_agent_uid), str(self.human_agent_uid)],
-                obs,
-            )
-        self.world_graph[self.conf.human_agent_uid].update(
-            most_recent_human_subgraph,
-            self.partial_obs,
-            "gt",  # human's WG is always updated in privileged mode
-        )
+        # human belief graph is kept stable until human-provided updates arrive
+        self._refresh_world_graph_aliases()
 
     def get_frame_description(self, obs):
         """
