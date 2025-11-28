@@ -1384,4 +1384,8 @@ class ScriptedCentralizedPlanner(Planner):
 
         # update world based on actions
         self.update_world(responses)
-        return low_level_actions, planner_info, should_stop
+        return (
+            low_level_actions,
+            self._augment_planner_info(planner_info),
+            should_stop,
+        )

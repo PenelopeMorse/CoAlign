@@ -4,16 +4,17 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree
 
+import json
 import logging
 from collections import defaultdict
-from typing import List, Optional, Union
+from copy import deepcopy
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 
-from habitat_llm.world_model import (
+from habitat_llm.world_model.entity import (
+    Concept,
     Entity,
-    Furniture,
-    Graph,
     House,
     Human,
     Object,
@@ -21,6 +22,8 @@ from habitat_llm.world_model import (
     Room,
     SpotRobot,
 )
+from habitat_llm.world_model.entities.furniture import Furniture
+from habitat_llm.world_model.graph import Graph
 
 
 def flip_edge(edge: str) -> str:
@@ -29,6 +32,8 @@ def flip_edge(edge: str) -> str:
         "on": "under",
         "in": "has",
         "inside": "contains",
+        "describes": "described_by",
+        "represents": "represented_by",
     }.get(edge, "unknown")
 
 
@@ -41,7 +46,7 @@ class WorldGraph(Graph):
     """
 
     # Parameterized Constructor
-    def __init__(self, graph=None):
+    def __init__(self, graph=None, graph_type: Optional[str] = None):
         # Create a graph to store different entities in the world
         # and their relations to one another
         super().__init__(graph=graph)
@@ -77,6 +82,86 @@ class WorldGraph(Graph):
         This method returns all objects in the world graph
         """
         return [node for node in self.graph if isinstance(node, Object)]
+
+    def add_or_update_concept_annotation(
+        self,
+        target: Union[str, Entity],
+        concept_labels: List[str],
+        concept_confidence: List[float],
+        concept_node_name: Optional[str] = None,
+        relation: str = "describes",
+    ) -> Concept:
+        """Attach concept annotations (labels + confidences) to a node and optional concept node.
+
+        Args:
+            target: The entity or entity name to annotate.
+            concept_labels: Concept labels describing the target.
+            concept_confidence: Confidence values aligned with ``concept_labels``.
+            concept_node_name: Optional explicit name for the concept node. Defaults to
+                ``concept_<target>`` when omitted.
+            relation: Edge label used between concept and target nodes.
+        """
+
+        if len(concept_labels) != len(concept_confidence):
+            raise ValueError("concept_labels and concept_confidence must be the same length")
+
+        if isinstance(target, str):
+            target_node = self.get_node_from_name(target)
+        else:
+            target_node = target
+
+        merged_labels, merged_confidence = self._merge_concept_properties(
+            target_node.properties.get("concept_labels", []),
+            target_node.properties.get("concept_confidence", []),
+            concept_labels,
+            concept_confidence,
+        )
+        target_node.properties["concept_labels"] = merged_labels
+        target_node.properties["concept_confidence"] = merged_confidence
+
+        concept_name = concept_node_name or f"concept_{target_node.name}"
+        try:
+            concept_node = self.get_node_from_name(concept_name)
+            if not isinstance(concept_node, Concept):
+                raise ValueError(f"Existing node {concept_name} is not a Concept")
+        except ValueError:
+            concept_node = Concept(
+                concept_name,
+                {
+                    "type": "concept",
+                    "concept_labels": merged_labels,
+                    "concept_confidence": merged_confidence,
+                },
+            )
+            self.add_node(concept_node)
+        else:
+            concept_node.properties["concept_labels"] = merged_labels
+            concept_node.properties["concept_confidence"] = merged_confidence
+
+        opposite_relation = flip_edge(relation)
+        if opposite_relation == "unknown":
+            opposite_relation = relation
+        self.add_edge(concept_node, target_node, relation, opposite_relation)
+        return concept_node
+
+    @staticmethod
+    def _merge_concept_properties(
+        existing_labels: List[str],
+        existing_confidence: List[float],
+        new_labels: List[str],
+        new_confidence: List[float],
+    ) -> tuple[list[str], list[float]]:
+        """Merge concept labels/confidences preferring highest confidence per label."""
+
+        confidence_map = {label: conf for label, conf in zip(existing_labels, existing_confidence)}
+        for label, conf in zip(new_labels, new_confidence):
+            if label in confidence_map:
+                confidence_map[label] = max(confidence_map[label], conf)
+            else:
+                confidence_map[label] = conf
+        merged_labels = list(confidence_map.keys())
+        merged_confidence = [confidence_map[label] for label in merged_labels]
+        return merged_labels, merged_confidence
 
     def get_node_with_property(self, property_key, property_val):
         """
@@ -596,12 +681,48 @@ class WorldGraph(Graph):
         dot += "}"
         return dot
 
+    def serialize_concept_layer(self) -> dict:
+        """Serialize concept annotations for downstream logging or planner use."""
+
+        entity_concepts = []
+        concept_nodes = []
+        for node in self.graph:
+            labels = node.properties.get("concept_labels")
+            confidence = node.properties.get("concept_confidence")
+            if labels is not None and confidence is not None:
+                record = {
+                    "name": node.name,
+                    "type": node.properties.get("type"),
+                    "concept_labels": labels,
+                    "concept_confidence": confidence,
+                }
+                if isinstance(node, Concept):
+                    concept_nodes.append(record)
+                else:
+                    entity_concepts.append(record)
+
+        return {
+            "entity_concepts": entity_concepts,
+            "concept_nodes": concept_nodes,
+        }
+
+    def log_concept_layer(self, log_path: Optional[str] = None) -> dict:
+        """Serialize and optionally write concept layer to disk for debugging."""
+
+        serialized = self.serialize_concept_layer()
+        serialized_str = json.dumps(serialized, indent=2, default=str)
+        self._logger.debug("Concept layer: %s", serialized_str)
+        if log_path is not None:
+            with open(log_path, "w") as f:
+                f.write(serialized_str)
+        return serialized
+
     def __deepcopy__(self, memo):
         """
         Method to deep copy this instance
         """
         graph_copy = super().__deepcopy__(memo)
-        wg = WorldGraph()
+        wg = WorldGraph(graph_type=self.graph_type)
         wg.graph = graph_copy.graph
         return wg
 
@@ -667,3 +788,60 @@ class WorldGraph(Graph):
         else:
             within_threshold = closest
         return within_threshold
+
+
+class BeliefGraphContainer:
+    """Container that keeps robot and human belief graphs in sync.
+
+    It provides helper APIs to update each belief independently, switch the active
+    view, and compute divergence between the two graphs.
+    """
+
+    def __init__(
+        self,
+        robot_graph: Optional[WorldGraph] = None,
+        human_graph: Optional[WorldGraph] = None,
+    ) -> None:
+        self._graphs: Dict[str, WorldGraph] = {
+            "robot": robot_graph or WorldGraph(graph_type="robot"),
+            "human": human_graph or WorldGraph(graph_type="human"),
+        }
+        # Track the active graph type for convenience (defaults to robot)
+        self.active_graph_type: str = "robot"
+
+    def set_active_graph(self, graph_type: str) -> None:
+        if graph_type not in self._graphs:
+            raise ValueError(f"Unknown graph_type {graph_type}")
+        self.active_graph_type = graph_type
+
+    def get_graph(self, graph_type: Optional[str] = None) -> WorldGraph:
+        graph_type = graph_type or self.active_graph_type
+        if graph_type not in self._graphs:
+            raise ValueError(f"Unknown graph_type {graph_type}")
+        return self._graphs[graph_type]
+
+    def update_robot_belief(
+        self, recent_graph: Graph, partial_obs: bool, update_mode: str, add_only: bool = False
+    ) -> None:
+        self._graphs["robot"].update(recent_graph, partial_obs, update_mode, add_only)
+
+    def update_human_belief(
+        self, recent_graph: Graph, partial_obs: bool, update_mode: str, add_only: bool = False
+    ) -> None:
+        self._graphs["human"].update(recent_graph, partial_obs, update_mode, add_only)
+
+    def sync_graphs(self, from_graph: str = "robot", to_graph: str = "human") -> None:
+        """Copy belief state from one graph to the other."""
+
+        if from_graph not in self._graphs or to_graph not in self._graphs:
+            raise ValueError("sync_graphs requires valid graph keys: 'robot' or 'human'")
+        self._graphs[to_graph] = deepcopy(self._graphs[from_graph])
+        self._graphs[to_graph].graph_type = to_graph
+
+    def compute_belief_divergence(self) -> Dict[str, float]:
+        from habitat_llm.world_model.belief_divergence import compute_belief_divergence
+
+        return compute_belief_divergence(
+            self._graphs["robot"],
+            self._graphs["human"],
+        )

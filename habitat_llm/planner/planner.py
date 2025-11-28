@@ -38,6 +38,17 @@ class Planner:
         self.swap_instruction: bool = True
         self.last_high_level_actions: Dict[int, Tuple[str, str, str]] = {}
 
+    def get_belief_gap(self) -> Dict[str, Any]:
+        """Expose divergence metrics between robot and human beliefs."""
+
+        if hasattr(self.env_interface, "get_belief_divergence"):
+            return self.env_interface.get_belief_divergence()
+        return {}
+
+    def _augment_planner_info(self, planner_info: Dict[str, Any]) -> Dict[str, Any]:
+        planner_info["belief_gap"] = self.get_belief_gap()
+        return planner_info
+
     def get_next_action(
         self,
         instruction: str,

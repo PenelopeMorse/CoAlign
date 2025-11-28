@@ -612,7 +612,7 @@ class LLMPlanner(Planner):
                 },
                 "is_done": {agent.uid: self.is_done for agent in self.agents},
             }
-            return {}, planner_info, self.is_done
+            return {}, self._augment_planner_info(planner_info), self.is_done
 
         if self.curr_prompt == "":
             # Prepare prompts
@@ -708,7 +708,7 @@ class LLMPlanner(Planner):
                         agent.uid: ("Done", None, None) for agent in self.agents
                     },
                 }
-                return {}, planner_info, self.is_done
+                return {}, self._augment_planner_info(planner_info), self.is_done
 
             # Parse high level action directives from llm response
             high_level_actions = self.actions_parser(
